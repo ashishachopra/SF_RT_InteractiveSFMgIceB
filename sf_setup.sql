@@ -54,56 +54,42 @@ CREATE WAREHOUSE IF NOT EXISTS LOAD_WH
 -- ---------------------------------------------------------------------------
 -- 3. Standard Table (FDN) — 1 Billion Rows
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE TABLE TXN_HISTORY (
-    TXN_ID          NUMBER(20,0),
-    CUSTOMER_ID     NUMBER(10,0),
-    CUSTOMER_EMAIL  VARCHAR,
-    TXN_NUM         VARCHAR,
-    TXN_DATE        TIMESTAMP_LTZ,
-    QUANTITY         NUMBER(2,0),
-    UNIT_PRICE      FLOAT,
-    PRODUCT_ID      VARCHAR,
-    PRODUCT_CATEGORY VARCHAR,
-    STORE_ID        NUMBER(3,0),
-    STORE_STATE_CD  VARCHAR
-)
-CLUSTER BY (CUSTOMER_ID);
-
--- Generate 1B rows with realistic distributions:
---   - 100M distinct customers (customer_id 1..100,000,000)
---   - Each customer has ~10 transactions on average
---   - 51 US state codes, 20 product categories, 700 stores
---   - Dates spanning ~7 years
---   - Unit prices $1-$500, quantities 1-20
+-- Generated with correlated fields for realism:
+--   - 100M distinct customers; CUSTOMER_EMAIL is derived from CUSTOMER_ID
+--   - STORE_ID and STORE_STATE_CD share RANDOM seed 7, so store<->state correlate
+--   - ~7 years of history (rolling from today)
+--   - CLUSTER BY (CUSTOMER_ID) + ORDER BY on load: essential for point-lookup
+--     partition pruning. Without it, every query scans all partitions.
 USE WAREHOUSE LOAD_WH;
 
-INSERT INTO TXN_HISTORY
-SELECT
-    ROW_NUMBER() OVER (ORDER BY SEQ8())                           AS txn_id,
-    UNIFORM(1, 100000000, RANDOM())                               AS customer_id,
-    'user' || UNIFORM(1, 100000000, RANDOM()) || '@example.com'   AS customer_email,
-    'TXN-' || LPAD(ROW_NUMBER() OVER (ORDER BY SEQ8()), 12, '0') AS txn_num,
-    DATEADD('second',
-            UNIFORM(0, 220752000, RANDOM()),
-            '2019-09-01'::TIMESTAMP_LTZ)                          AS txn_date,
-    UNIFORM(1, 20, RANDOM())                                      AS quantity,
-    ROUND(UNIFORM(1, 50000, RANDOM()) / 100.0, 2)                AS unit_price,
-    'PROD-' || LPAD(UNIFORM(1, 5000, RANDOM()), 5, '0')          AS product_id,
-    ARRAY_CONSTRUCT(
-        'Electronics','Clothing','Home & Garden','Sports','Toys',
-        'Books','Automotive','Health','Food','Beauty',
-        'Pet Supplies','Office','Music','Movies','Software',
-        'Jewelry','Shoes','Furniture','Appliances','Tools'
-    )[UNIFORM(0, 19, RANDOM())]::VARCHAR                          AS product_category,
-    UNIFORM(1, 700, RANDOM())                                     AS store_id,
-    ARRAY_CONSTRUCT(
-        'AL','AK','AZ','AR','CA','CO','CT','DE','FL','GA',
-        'HI','ID','IL','IN','IA','KS','KY','LA','ME','MD',
-        'MA','MI','MN','MS','MO','MT','NE','NV','NH','NJ',
-        'NM','NY','NC','ND','OH','OK','OR','PA','RI','SC',
-        'SD','TN','TX','UT','VT','VA','WA','WV','WI','WY','DC'
-    )[UNIFORM(0, 50, RANDOM())]::VARCHAR                          AS store_state_cd
-FROM TABLE(GENERATOR(ROWCOUNT => 1000000000));
+CREATE OR REPLACE TABLE TXN_HISTORY CLUSTER BY (CUSTOMER_ID) AS
+    SELECT
+        SEQ8()+1 TXN_ID,
+        UNIFORM(1, 100000000, RANDOM(1))::NUMBER(10,0) CUSTOMER_ID,
+        'user'||CUSTOMER_ID||'@example.com' AS CUSTOMER_EMAIL,
+        UPPER(CHR(UNIFORM(65, 90, RANDOM(2)))) || LPAD(UNIFORM(0, 99999999999, RANDOM(6))::NUMBER, 11, '0') AS TXN_NUM,
+        -- 7 years of history
+        DATEADD('second', UNIFORM(0, 220752000, RANDOM(3)), DATEADD('year', -7, CURRENT_TIMESTAMP()))::TIMESTAMP_LTZ(6) AS TXN_DATE,
+        UNIFORM(0, 30, RANDOM(4)) QUANTITY,
+        ROUND(UNIFORM(1, 99999, RANDOM(5))::FLOAT / 100, 2) AS UNIT_PRICE,
+        'SKU-' || LPAD(UNIFORM(1, 500000, RANDOM())::STRING, 7, '0') || '-' || LPAD(UNIFORM(0,99,RANDOM()), 2, '0')::STRING AS PRODUCT_ID,
+        ARRAY_CONSTRUCT(
+            'Electronics', 'Grocery', 'Apparel', 'Home & Garden', 'Sports',
+            'Automotive', 'Health & Beauty', 'Toys & Games', 'Office Supplies', 'Pet Supplies',
+            'Jewelry', 'Books & Media', 'Furniture', 'Kitchen & Dining', 'Baby & Kids',
+            'Outdoor & Camping', 'Tools & Hardware', 'Travel & Luggage', 'Music & Instruments', 'Arts & Crafts'
+        )[UNIFORM(0, 19, RANDOM(6))]::STRING AS PRODUCT_CATEGORY,
+        UNIFORM(0, 700, RANDOM(7)) STORE_ID,
+        -- Same seed (RANDOM(7)) as STORE_ID so stores and states are correlated
+        ARRAY_CONSTRUCT(
+            'AL','AK','AZ','AR','CA','CO','CT','DE','FL','GA',
+            'HI','ID','IL','IN','IA','KS','KY','LA','ME','MD',
+            'MA','MI','MN','MS','MO','MT','NE','NV','NH','NJ',
+            'NM','NY','NC','ND','OH','OK','OR','PA','RI','SC',
+            'SD','TN','TX','UT','VT','VA','WA','WV','WI','WY','DC'
+        )[MOD(UNIFORM(0, 700, RANDOM(7)), 51)]::STRING AS STORE_STATE_CD
+    FROM TABLE(GENERATOR(ROWCOUNT => 1000000000))
+    ORDER BY CUSTOMER_ID;
 
 -- Verify row count
 SELECT COUNT(*) AS row_count FROM TXN_HISTORY;
@@ -127,7 +113,7 @@ CREATE OR REPLACE INTERACTIVE TABLE TXN_HISTORY_IT (
 )
 CLUSTER BY (CUSTOMER_ID);
 
-INSERT INTO TXN_HISTORY_IT SELECT * FROM TXN_HISTORY;
+INSERT INTO TXN_HISTORY_IT SELECT * FROM TXN_HISTORY ORDER BY CUSTOMER_ID;
 
 -- Verify
 SELECT COUNT(*) AS row_count FROM TXN_HISTORY_IT;
@@ -138,28 +124,44 @@ SELECT COUNT(*) AS row_count FROM TXN_HISTORY_IT;
 -- ---------------------------------------------------------------------------
 -- Skip this entire section unless you want the third (Iceberg) table type.
 -- It is NOT required for the FDN or IT benchmarks.
--- Third table type for the benchmark: an externally-managed Apache Iceberg
--- table read through a catalog integration (this example uses a Polaris /
--- Open Catalog REST catalog).
 --
--- PREREQUISITES (environment-specific — you must create these first):
---   1. An EXTERNAL VOLUME pointing at your object-store location.
---   2. A CATALOG INTEGRATION of your Iceberg catalog.
--- See: https://docs.snowflake.com/en/user-guide/tables-iceberg
+-- Third table type: a Snowflake-managed Apache Iceberg table living in a
+-- catalog-linked database (this example: ICE_DB_CLD). Because the database is
+-- catalog-linked, the table inherits its external volume and catalog from the
+-- database — there is no per-table EXTERNAL_VOLUME / CATALOG clause.
+--
+-- PREREQUISITE (environment-specific — you must create this first):
+--   A catalog-linked database backed by your Iceberg catalog + external volume.
+--   See: https://docs.snowflake.com/en/user-guide/tables-iceberg
+--
+-- TARGET_FILE_SIZE = '16MB' produces small files well-suited to the selective
+-- point-lookup / small-aggregation query pattern.
 --
 -- The benchmark references this table with the label "IB". If you skip this
--- section, simply don't pass "--tables IB" to benchmark.py.
+-- section, simply don't pass "--tables IB" to benchmark.py (and remove the
+-- IB entry from the TABLES dict in benchmark.py).
 --
--- Example (edit CATALOG, EXTERNAL_VOLUME, BASE_LOCATION for your account):
+-- Replace <catalog_linked_db> and <namespace> with your own.
 --
--- CREATE OR REPLACE ICEBERG TABLE TXN_HISTORY_IB
---     EXTERNAL_VOLUME    = 'my_external_volume'
---     CATALOG            = 'my_catalog_integration'
---     CATALOG_TABLE_NAME = 'txn_history_IB'
---     CATALOG_NAMESPACE  = 'my_namespace';
+-- CREATE OR REPLACE ICEBERG TABLE <catalog_linked_db>."<namespace>"."txn_history_IB" (
+--     TXN_ID           NUMBER(19,0),
+--     CUSTOMER_ID      NUMBER(10,0),
+--     CUSTOMER_EMAIL   STRING,
+--     TXN_NUM          STRING,
+--     TXN_DATE         TIMESTAMP_NTZ(6),
+--     QUANTITY         NUMBER(2,0),
+--     UNIT_PRICE       FLOAT,
+--     PRODUCT_ID       STRING,
+--     PRODUCT_CATEGORY STRING,
+--     STORE_ID         NUMBER(4,0),
+--     STORE_STATE_CD   STRING
+-- )
+-- TARGET_FILE_SIZE = '16MB';
 --
--- If you manage the Iceberg data outside Snowflake, load it with the same
--- 1B-row shape as TXN_HISTORY so the queries are comparable.
+-- -- Load from the standard table, preserving clustering order:
+-- INSERT OVERWRITE INTO <catalog_linked_db>."<namespace>"."txn_history_IB"
+-- SELECT * FROM SNOW_DB.SNOW_SCHEMA.TXN_HISTORY
+-- ORDER BY CUSTOMER_ID;
 
 -- ---------------------------------------------------------------------------
 -- 6. Masking Policy — OPTIONAL (governance-overhead test)

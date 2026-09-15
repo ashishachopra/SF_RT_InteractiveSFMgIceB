@@ -241,16 +241,17 @@ def _run_workers(connection_name, warehouse, query_sql, gen, concurrency,
             stats["errors"], stats["last_error"])
 
 
-# Module-level reference for pickle-safe multiprocessing
-_CONNECTION_NAME = None
+def _proc_entry(connection_name, warehouse, query_sql, qry_name, concurrency,
+                duration_sec, tag_json, result_q):
+    """Child-process entry point. Each process gets its own GIL.
 
-
-def _proc_entry(warehouse, query_sql, qry_name, concurrency, duration_sec,
-                tag_json, result_q):
-    """Child-process entry point. Each process gets its own GIL."""
+    connection_name is passed explicitly (not via a module global) so this
+    works under the 'spawn' start method used on macOS and Windows, where
+    children do not inherit the parent's runtime globals.
+    """
     gen = QUERY_TEMPLATES[qry_name]["gen"]
     completed, elapsed, errors, last_error = _run_workers(
-        _CONNECTION_NAME, warehouse, query_sql, gen,
+        connection_name, warehouse, query_sql, gen,
         concurrency, duration_sec, tag_json)
     result_q.put((completed, elapsed, errors, last_error))
 
@@ -263,9 +264,6 @@ def run_benchmark(run_id, connection_name, warehouse, tbl_label, test_name,
     When procs > 1, concurrency is divided across processes so each process
     runs concurrency // procs threads on its own GIL.
     """
-    global _CONNECTION_NAME
-    _CONNECTION_NAME = connection_name
-
     tag_json = {
         "run_id": run_id,
         "test": test_name,
@@ -290,8 +288,8 @@ def run_benchmark(run_id, connection_name, warehouse, tbl_label, test_name,
         for slice_conc in slices:
             p = multiprocessing.Process(
                 target=_proc_entry,
-                args=(warehouse, query_sql, qry_name, slice_conc,
-                      duration_sec, tag_json, result_q),
+                args=(connection_name, warehouse, query_sql, qry_name,
+                      slice_conc, duration_sec, tag_json, result_q),
             )
             p.start()
             processes.append(p)

@@ -45,7 +45,6 @@ import snowflake.connector
 IWH = "TXN_INTERACTIVE_WH"
 STD_WH = "COMPUTE_XS_WH"
 IT_FQN = "SNOW_DB.SNOW_SCHEMA.TXN_HISTORY_IT"
-FDN_FQN = "SNOW_DB.SNOW_SCHEMA.TXN_HISTORY"
 
 BENCHMARK_SCRIPT = str(Path(__file__).parent / "benchmark.py")
 LOG_DIR = Path("/tmp/iwh_benchmark_logs")
@@ -208,8 +207,12 @@ def phase2_mcw(connection_name, warm_wait_min, summary):
     print("PHASE 2: Multi-Cluster Warehouse (MCW=2)")
     print(f"{'='*70}", flush=True)
 
-    # Set 2 clusters
+    # Self-contained setup so this phase can run standalone (--phase 2):
+    # resume, attach IT, set MCL=32, then scale to 2 clusters.
     run_sql(connection_name, STD_WH,
+            f"ALTER WAREHOUSE {IWH} RESUME IF SUSPENDED",
+            f"ALTER WAREHOUSE {IWH} ADD TABLES ({IT_FQN})",
+            f"ALTER WAREHOUSE {IWH} SET MAX_CONCURRENCY_LEVEL = 32",
             f"ALTER WAREHOUSE {IWH} SET MIN_CLUSTER_COUNT = 2, "
             f"MAX_CLUSTER_COUNT = 2")
 
@@ -289,18 +292,25 @@ def main():
     print(f"Warm wait:  {args.warm_wait} min")
     print("=" * 70, flush=True)
 
-    if 1 in args.phase:
-        phase1_single_cluster(args.connection, args.warm_wait, summary)
+    # Wrap the run so that, no matter how a phase fails, we always revert the
+    # warehouse to 1 cluster and suspend it. The IWH has a 24h auto-suspend,
+    # so a crash mid-run could otherwise leave a multi-cluster warehouse
+    # running (and billing) for a long time.
+    try:
+        if 1 in args.phase:
+            phase1_single_cluster(args.connection, args.warm_wait, summary)
 
-    if 2 in args.phase:
-        phase2_mcw(args.connection, args.warm_wait, summary)
+        if 2 in args.phase:
+            phase2_mcw(args.connection, args.warm_wait, summary)
 
-    if 3 in args.phase:
-        phase3_regular_wh(args.connection, summary)
-
-    # Suspend IWH
-    print("\nSuspending IWH...", flush=True)
-    run_sql(args.connection, STD_WH, f"ALTER WAREHOUSE {IWH} SUSPEND")
+        if 3 in args.phase:
+            phase3_regular_wh(args.connection, summary)
+    finally:
+        print("\nReverting to 1 cluster and suspending IWH...", flush=True)
+        run_sql(args.connection, STD_WH,
+                f"ALTER WAREHOUSE {IWH} SET MIN_CLUSTER_COUNT = 1, "
+                f"MAX_CLUSTER_COUNT = 1",
+                f"ALTER WAREHOUSE {IWH} SUSPEND")
 
     # Summary
     summary_file = LOG_DIR / f"suite_{suite_id}_summary.json"

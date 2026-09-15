@@ -1,0 +1,2 @@
+# IWH Concurrency Benchmark — Python dependencies
+snowflake-connector-python>=3.0

@@ -1,0 +1,27 @@
+# Copy this file to ~/.snowflake/connections.toml (or merge into your existing
+# one) and fill in your account details. Then pass the section name to the
+# benchmark with --connection my_connection.
+#
+# Docs: https://docs.snowflake.com/en/developer-guide/snowflake-cli/connecting/configure-connections
+
+[my_connection]
+account = "your-account-locator"       # e.g. abc1234.us-east-1
+user = "your_user"
+
+# --- Pick ONE authentication method ---
+
+# Option A: external browser SSO (recommended for interactive use)
+authenticator = "externalbrowser"
+
+# Option B: password
+# password = "your_password"
+
+# Option C: key-pair auth (recommended for unattended suite runs)
+# authenticator = "SNOWFLAKE_JWT"
+# private_key_file = "/path/to/rsa_key.p8"
+
+# --- Session defaults ---
+warehouse = "COMPUTE_XS_WH"
+database = "SNOW_DB"
+schema = "SNOW_SCHEMA"
+role = "SYSADMIN"

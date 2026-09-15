@@ -3,16 +3,23 @@
 -- =============================================================================
 -- Creates all objects needed to run the benchmark:
 --   1. Database and schema
---   2. Standard table (TXN_HISTORY) with 1B rows, clustered by CUSTOMER_ID
---   3. Interactive table (TXN_HISTORY_IT) — same schema
---   4. Regular warehouse (COMPUTE_XS_WH) — baseline
---   5. Interactive warehouse (TXN_INTERACTIVE_WH) — test subject
+--   2. Warehouses: COMPUTE_XS_WH (regular baseline), TXN_INTERACTIVE_WH
+--      (interactive test subject), LOAD_WH (XLARGE, for data generation only)
+--   3. Standard table (TXN_HISTORY) — 1B rows, CLUSTER BY (CUSTOMER_ID)
+--   4. Interactive table (TXN_HISTORY_IT) — same data
+--   OPTIONAL:
+--   5. External Iceberg table (IB)   — requires a catalog-linked database
+--   6. EMAIL_MASK masking policy     — governance-overhead test
+--   7. Attach interactive table; 8. suspend load warehouse
 --
--- Data generation uses Snowflake's GENERATOR to produce 1B synthetic
--- transaction rows with 100M distinct customers, 51 US states, 20 product
--- categories, and 700 stores over a ~7 year date range.
+-- Data generation produces 1B synthetic rows (~100M distinct customers,
+-- 51 US states, 20 categories, 700 stores, ~7 years). CUSTOMER_EMAIL is
+-- derived from CUSTOMER_ID and STORE_ID/STORE_STATE_CD are correlated.
 --
--- Estimated time: ~15-20 minutes on an XL warehouse for the 1B row INSERT.
+-- Cost/time note: the 1B-row load runs twice (standard table, then interactive
+-- table) on the XLARGE LOAD_WH. On an XL this is fast — roughly a minute or two
+-- per load; larger/smaller warehouses scale accordingly. LOAD_WH auto-suspends
+-- after 60s. Review the credit cost before running.
 -- =============================================================================
 
 USE ROLE SYSADMIN;

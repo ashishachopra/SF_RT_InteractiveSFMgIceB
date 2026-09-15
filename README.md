@@ -79,7 +79,7 @@ It also contains **optional** sections — commented out with their prerequisite
 snowsql -c my_connection -f sf_setup.sql
 ```
 
-The 1B row INSERT takes ~15-20 minutes on an XL warehouse. The interactive table INSERT is a second pass of the same duration.
+The 1B-row load is fast on an XL warehouse — typically a minute or two — and runs twice (standard table, then interactive table). Smaller or larger warehouses scale accordingly.
 
 ## Quick Start
 

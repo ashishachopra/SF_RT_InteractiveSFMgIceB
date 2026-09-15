@@ -134,13 +134,72 @@ SELECT COUNT(*) AS row_count FROM TXN_HISTORY_IT;
 -- Expected: 1,000,000,000
 
 -- ---------------------------------------------------------------------------
--- 5. Attach Interactive Table to Interactive Warehouse
+-- 5. External Iceberg Table (IB) — OPTIONAL · REQUIRES AN EXTERNAL CATALOG
+-- ---------------------------------------------------------------------------
+-- Skip this entire section unless you want the third (Iceberg) table type.
+-- It is NOT required for the FDN or IT benchmarks.
+-- Third table type for the benchmark: an externally-managed Apache Iceberg
+-- table read through a catalog integration (this example uses a Polaris /
+-- Open Catalog REST catalog).
+--
+-- PREREQUISITES (environment-specific — you must create these first):
+--   1. An EXTERNAL VOLUME pointing at your object-store location.
+--   2. A CATALOG INTEGRATION of your Iceberg catalog.
+-- See: https://docs.snowflake.com/en/user-guide/tables-iceberg
+--
+-- The benchmark references this table with the label "IB". If you skip this
+-- section, simply don't pass "--tables IB" to benchmark.py.
+--
+-- Example (edit CATALOG, EXTERNAL_VOLUME, BASE_LOCATION for your account):
+--
+-- CREATE OR REPLACE ICEBERG TABLE TXN_HISTORY_IB
+--     EXTERNAL_VOLUME    = 'my_external_volume'
+--     CATALOG            = 'my_catalog_integration'
+--     CATALOG_TABLE_NAME = 'txn_history_IB'
+--     CATALOG_NAMESPACE  = 'my_namespace';
+--
+-- If you manage the Iceberg data outside Snowflake, load it with the same
+-- 1B-row shape as TXN_HISTORY so the queries are comparable.
+
+-- ---------------------------------------------------------------------------
+-- 6. Masking Policy — OPTIONAL (governance-overhead test)
+-- ---------------------------------------------------------------------------
+-- Skip this entire section unless you want to measure the cost of column-level
+-- governance. It is NOT required for any of the core benchmarks.
+--
+-- The benchmark's "point_lookup_email" query reads CUSTOMER_EMAIL. Applying a
+-- masking policy to that column lets you measure the throughput/latency cost
+-- of column-level governance: run point_lookup_email with the policy ATTACHED,
+-- then UNSET it and re-run, and compare.
+--
+-- Create the policy (uncomment to enable):
+-- CREATE OR REPLACE MASKING POLICY SNOW_DB.SNOW_SCHEMA.EMAIL_MASK
+--     AS (VAL VARCHAR) RETURNS VARCHAR ->
+--     CASE
+--         WHEN CURRENT_ROLE() IN ('SECURITYADMIN', 'ACCOUNTADMIN') THEN VAL
+--         ELSE REGEXP_REPLACE(VAL, '^[^@]+', '***')
+--     END;
+
+-- Attach it to CUSTOMER_EMAIL on whichever table(s) you are testing, e.g.:
+--   ALTER TABLE TXN_HISTORY_IT
+--       MODIFY COLUMN CUSTOMER_EMAIL SET MASKING POLICY SNOW_DB.SNOW_SCHEMA.EMAIL_MASK;
+--
+-- Run the masking benchmark (as a non-privileged role so masking engages):
+--   python benchmark.py --connection my_conn --full \
+--       --tables IT --warehouses IWH --queries point_lookup_email --procs 8
+--
+-- Then detach and re-run the same command to get the un-masked baseline:
+--   ALTER TABLE TXN_HISTORY_IT
+--       MODIFY COLUMN CUSTOMER_EMAIL UNSET MASKING POLICY;
+
+-- ---------------------------------------------------------------------------
+-- 7. Attach Interactive Table to Interactive Warehouse
 -- ---------------------------------------------------------------------------
 ALTER WAREHOUSE TXN_INTERACTIVE_WH RESUME;
 ALTER WAREHOUSE TXN_INTERACTIVE_WH ADD TABLES (SNOW_DB.SNOW_SCHEMA.TXN_HISTORY_IT);
 
 -- ---------------------------------------------------------------------------
--- 6. Cleanup: suspend load warehouse
+-- 8. Cleanup: suspend load warehouse
 -- ---------------------------------------------------------------------------
 ALTER WAREHOUSE LOAD_WH SUSPEND;
 

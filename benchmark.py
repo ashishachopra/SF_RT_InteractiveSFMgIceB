@@ -65,9 +65,13 @@ WAREHOUSES = {
 }
 
 # Table mapping (label -> fully qualified name)
+#   FDN = standard table, IT = interactive table
+#   IB  = external Iceberg table (OPTIONAL — requires an external catalog
+#         integration; see sf_setup.sql. Remove this entry if unused.)
 TABLES = {
     "FDN": "SNOW_DB.SNOW_SCHEMA.TXN_HISTORY",
     "IT":  "SNOW_DB.SNOW_SCHEMA.TXN_HISTORY_IT",
+    "IB":  'ICE_DB_CLD."hassium_db"."txn_history_IB"',
 }
 
 
@@ -106,6 +110,18 @@ QUERY_TEMPLATES = {
             "GROUP BY 1, 2 ORDER BY 4 DESC"
         ),
         "gen": _customer360_gen,
+    },
+    # Point lookup that reads CUSTOMER_EMAIL. Used for the masking-policy
+    # overhead test: run this with and without EMAIL_MASK applied to the
+    # column and compare QPS / latency (see sf_setup.sql).
+    "point_lookup_email": {
+        "label": "Point Lookup (Email)",
+        "sql": (
+            "SELECT ANY_VALUE(CUSTOMER_EMAIL), COUNT(*), "
+            "SUM(UNIT_PRICE * QUANTITY) "
+            "FROM {table} WHERE CUSTOMER_ID = %s"
+        ),
+        "gen": _point_lookup_gen,
     },
 }
 
@@ -162,6 +178,7 @@ def worker_loop(conn, query_sql, gen, stop_event, stats):
     """
     local_count = 0
     local_errors = 0
+    last_error = None
 
     while not stop_event.is_set():
         cur = conn.cursor()
@@ -174,14 +191,17 @@ def worker_loop(conn, query_sql, gen, stop_event, stats):
                 cur.execute(sql)
             cur.fetchone()
             local_count += 1
-        except Exception:
+        except Exception as e:
             local_errors += 1
+            last_error = str(e)
         finally:
             cur.close()
 
     with stats["lock"]:
         stats["completed"] += local_count
         stats["errors"] += local_errors
+        if last_error:
+            stats["last_error"] = last_error
 
 
 # ---------------------------------------------------------------------------
@@ -192,12 +212,13 @@ def _run_workers(connection_name, warehouse, query_sql, gen, concurrency,
                  duration_sec, tag_json):
     """
     Single-process benchmark unit. Runs `concurrency` threads for
-    `duration_sec` seconds. Returns (completed, wall_elapsed, errors).
+    `duration_sec` seconds. Returns (completed, wall_elapsed, errors, last_error).
     """
     pool_size = min(concurrency, POOL_SIZE)
     pool = create_pool(connection_name, warehouse, pool_size, tag_json)
 
-    stats = {"completed": 0, "errors": 0, "lock": threading.Lock()}
+    stats = {"completed": 0, "errors": 0, "last_error": None,
+             "lock": threading.Lock()}
     stop_event = threading.Event()
 
     wall_start = time.perf_counter()
@@ -216,7 +237,8 @@ def _run_workers(connection_name, warehouse, query_sql, gen, concurrency,
     wall_elapsed = time.perf_counter() - wall_start
     close_pool(pool)
 
-    return stats["completed"], wall_elapsed, stats["errors"]
+    return (stats["completed"], wall_elapsed,
+            stats["errors"], stats["last_error"])
 
 
 # Module-level reference for pickle-safe multiprocessing
@@ -227,10 +249,10 @@ def _proc_entry(warehouse, query_sql, qry_name, concurrency, duration_sec,
                 tag_json, result_q):
     """Child-process entry point. Each process gets its own GIL."""
     gen = QUERY_TEMPLATES[qry_name]["gen"]
-    completed, elapsed, errors = _run_workers(
+    completed, elapsed, errors, last_error = _run_workers(
         _CONNECTION_NAME, warehouse, query_sql, gen,
         concurrency, duration_sec, tag_json)
-    result_q.put((completed, elapsed, errors))
+    result_q.put((completed, elapsed, errors, last_error))
 
 
 def run_benchmark(run_id, connection_name, warehouse, tbl_label, test_name,
@@ -259,7 +281,7 @@ def run_benchmark(run_id, connection_name, warehouse, tbl_label, test_name,
           f"procs={procs_to_use} (threads/proc={slices})")
 
     if procs_to_use == 1:
-        completed, wall_elapsed, errors = _run_workers(
+        completed, wall_elapsed, errors, last_error = _run_workers(
             connection_name, warehouse, query_sql, gen,
             concurrency, duration_sec, tag_json)
     else:
@@ -274,20 +296,24 @@ def run_benchmark(run_id, connection_name, warehouse, tbl_label, test_name,
             p.start()
             processes.append(p)
 
-        completed, errors, elapseds = 0, 0, []
+        completed, errors, elapseds, last_error = 0, 0, [], None
         for _ in processes:
-            c, el, er = result_q.get()
+            c, el, er, lerr = result_q.get()
             completed += c
             errors += er
             elapseds.append(el)
+            if lerr:
+                last_error = lerr
         for p in processes:
             p.join()
-        wall_elapsed = (max(elapseds) if elapseds
-                        else time.perf_counter())
+        # Fall back to the intended run duration, not an absolute timestamp.
+        wall_elapsed = max(elapseds) if elapseds else float(duration_sec)
 
     qps = completed / wall_elapsed if wall_elapsed else 0
-    print(f"    done. {completed} queries, {qps:.1f} QPS, {errors} errors",
-          flush=True)
+    msg = f"    done. {completed} queries, {qps:.1f} QPS, {errors} errors"
+    if errors and last_error:
+        msg += f" (last: {last_error[:80]})"
+    print(msg, flush=True)
 
     return completed, wall_elapsed, errors
 
@@ -381,7 +407,7 @@ def main():
     parser.add_argument("--full", action="store_true",
                         help="Full benchmark (c=10-1000, 60s each)")
     parser.add_argument("--tables", nargs="*", default=None,
-                        help="Tables to test (FDN, IT). Default: all")
+                        help="Tables to test (FDN, IT, IB). Default: all")
     parser.add_argument("--warehouses", nargs="*", default=None,
                         help="Warehouses to test (IWH, STD). Default: all")
     parser.add_argument("--procs", type=int, default=1,
@@ -390,10 +416,24 @@ def main():
     parser.add_argument("--levels", nargs="*", type=int, default=None,
                         help="Override concurrency levels (e.g. --levels 250 500)")
     parser.add_argument("--queries", nargs="*", default=None,
-                        help="Query subset (point_lookup, customer360)")
+                        help="Query subset (point_lookup, customer360, "
+                             "point_lookup_email). Default: all")
     parser.add_argument("--duration", type=int, default=None,
                         help="Override run duration in seconds")
     args = parser.parse_args()
+
+    # Preflight: verify the named connection resolves and works before we
+    # spin up hundreds of workers. Fails fast with a readable message.
+    try:
+        _conn = make_connection(args.connection)
+        _conn.cursor().execute("SELECT 1").fetchone()
+        _conn.close()
+    except Exception as e:
+        print(f"ERROR: could not open connection '{args.connection}'.")
+        print(f"  Check that it exists in ~/.snowflake/connections.toml "
+              f"and the credentials are valid.")
+        print(f"  Underlying error: {e}")
+        raise SystemExit(1)
 
     mode = "full" if args.full else "test"
     config = MODES[mode]

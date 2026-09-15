@@ -4,6 +4,8 @@ A lightweight, portable benchmark for measuring **high-throughput query concurre
 
 **Blog**: [Real-Time Analytics on Snowflake: A Repeatable Benchmark for Sub-Second Latency at Scale](https://medium.com/@paul.needleman/real-time-analytics-on-snowflake-a-repeatable-benchmark-for-sub-second-latency-at-scale-49b666f2deb2)
 
+> **Disclaimer.** This is an informal, self-run benchmark shared to be reproduced, not an official or audited Snowflake result and not a TPC-style certified benchmark. The views here are my own. All numbers were measured on a specific account, region, warehouse size, and client machine, and **your results will vary** with any of those. The value of this repo is the method and the fact that you can run it yourself — treat the figures as illustrative, and reproduce them in your own environment before drawing conclusions. Snowflake and Interactive Warehouse are trademarks of Snowflake Inc.
+
 ## Why not just use JMeter?
 
 Tools like JMeter, Gatling, or k6 are excellent general-purpose load generators, but for this specific job — pushing a database to its concurrency ceiling and reading the results back from the database's own telemetry — they add friction:
@@ -153,6 +155,56 @@ python run_suite.py --connection my_conn --warm-wait 10
 
 Each phase includes: full-scan warming → benchmark warming → proactive cache wait → measured run.
 
+## Customizing — Bring Your Own Queries
+
+This is meant to be a **flexible harness, not a fixed test**. The two shipped queries are just examples of a selective-lookup pattern — swap in your own workload and the whole concurrency/latency/QPS machinery works unchanged.
+
+Queries live in the `QUERY_TEMPLATES` dict in `benchmark.py`. Each entry has three parts:
+
+```python
+QUERY_TEMPLATES = {
+    "my_query": {                          # <- the name you pass to --queries
+        "label": "My Query",               # <- shows up in output + QUERY_TAG
+        "sql": "SELECT ... FROM {table} WHERE some_col = %s {extra}",
+        "gen": _my_gen,                    # <- returns (extra_clause, params) per call
+    },
+}
+```
+
+- **`{table}`** is substituted with the fully-qualified table name at runtime, so one template runs against FDN, IT, or IB without edits.
+- **`%s`** placeholders are bound safely from the `params` tuple your `gen()` returns (never string-formatted — avoids SQL injection and lets Snowflake cache the plan).
+- **`gen()`** is called once per query execution and returns `(extra_clause, params)`:
+  - `params` — the bind values (e.g. a random id) so every execution hits different data and you're not just re-serving one cached row.
+  - `extra_clause` — optional text spliced in at `{extra}` for cases where you need to vary structure, not just values (e.g. a random `LIMIT` or an added predicate). Return `""` if unused.
+
+Example — a random date-range scan:
+
+```python
+def _date_range_gen():
+    start = random.randint(1, 2000)                 # days ago
+    span  = random.choice([7, 30, 90])
+    return "", (start, start - span)                # two bind params
+
+QUERY_TEMPLATES["recent_window"] = {
+    "label": "Recent Window",
+    "sql": ("SELECT STORE_STATE_CD, SUM(UNIT_PRICE*QUANTITY) FROM {table} "
+            "WHERE TXN_DATE BETWEEN DATEADD('day', -%s, CURRENT_DATE) "
+            "AND DATEADD('day', -%s, CURRENT_DATE) GROUP BY 1"),
+    "gen": _date_range_gen,
+}
+```
+
+Then run just your query:
+
+```bash
+python benchmark.py --connection my_conn --full \
+    --tables IT --warehouses IWH --queries recent_window --procs 8
+```
+
+Two things to keep in mind when you bring your own queries:
+- **Cluster the table on whatever column your query filters on** (see best practices) so pruning reflects a real production design.
+- **Randomize the bind values** in `gen()` — if every execution requests the same key, you're benchmarking the result cache, not the engine (the harness already sets `USE_CACHED_RESULT = FALSE`, but reusing one key still hits warm micro-partitions unrealistically).
+
 ## Architecture
 
 ```
@@ -211,14 +263,28 @@ WHERE query_tag LIKE '%YOUR_RUN_ID%'
 GROUP BY 1, 2 ORDER BY 1, 2;
 ```
 
+> **Important — the in-script summary is only a sample at high concurrency.**
+> After each run the script prints a server-side table pulled from
+> `INFORMATION_SCHEMA.QUERY_HISTORY`, which is capped at 10,000 rows per call.
+> A single `c=1000` level produces 100,000+ queries in 60s, so that table
+> reflects only the most recent ~10k and its QPS/percentiles will be
+> **understated**. Treat the in-script numbers as a live sanity check; use the
+> `ACCOUNT_USAGE` query above (no row cap) for the authoritative figures you
+> publish. `ACCOUNT_USAGE` lags ~45 min; `INFORMATION_SCHEMA` is near-real-time
+> but capped.
+
+### A note on fair comparison
+
+The suite deliberately warms the Interactive Warehouse (full-scan + benchmark warm + a proactive-cache wait) before measuring, because proactive caching is part of how it's meant to run. The regular-warehouse baseline (Phase 3) is **not** given the same warm-up. This is intentional — a regular warehouse has no proactive cache to prime — but it means the first queries in the baseline pay compilation and cold-scan costs. If you want a strictly warm-vs-warm comparison, add a warm-up pass before Phase 3 and note it in your results.
+
 ## Notes & Best Practices
 
 Read this before trusting any number the tool prints.
 
 - **Warm vs. cold cache.** All headline results are for a *warmed* warehouse. Interactive Warehouses use proactive caching; a cold warehouse will show much higher latency for the first queries. The suite's warming protocol exists precisely to remove this variable — don't compare a cold run to a warm one.
-- **Clustering is not optional — it's the whole game.** The tables are `CLUSTER BY (CUSTOMER_ID)` and loaded `ORDER BY CUSTOMER_ID`. Since every benchmark query filters on `CUSTOMER_ID`, clustering lets Snowflake prune to ~1 micro-partition instead of scanning all ~1,400. Drop the clustering and point-lookup latency collapses from tens of milliseconds to full-scan territory — you'd be benchmarking a table scan, not a lookup. If you adapt the queries to filter on a different column, cluster on that column.
+- **Clustering follows Snowflake best practice.** The tables are `CLUSTER BY (CUSTOMER_ID)` and loaded `ORDER BY CUSTOMER_ID` because the workload is selective lookups on `CUSTOMER_ID` — and aligning the clustering key with the filter column is the standard way to design any high-selectivity table on Snowflake, interactive or not. It lets the engine prune to the handful of micro-partitions that hold a customer's rows instead of scanning the whole table. This isn't specific to the benchmark; it's how you'd model this table in production. If you adapt the queries to filter on a different column, cluster on that column so the same pruning applies. (Skip clustering entirely and you'd be measuring a full-table scan, which is a different workload than the low-latency lookups this benchmark targets.)
 - **The client machine is a variable.** At high concurrency the *load generator* can become the bottleneck before the warehouse does. Results in the blog were generated from a 12-core laptop. Fewer cores, a busy machine, or high network latency to the Snowflake region will cap the concurrency you can actually generate. Run from a machine in (or near) the same cloud region for cleanest numbers, and watch client CPU during the run.
-- **Trust server-side numbers over client-side.** The console prints client-side QPS for a live signal, but connection setup and Python overhead make it *underreport*. The `QUERY_HISTORY` / `ACCOUNT_USAGE` numbers are authoritative — always report those.
+- **Reported numbers are server-side execution time, not client wall-clock.** The authoritative latency/QPS come from `QUERY_HISTORY` (`total_elapsed_time`), i.e. time measured inside Snowflake. Client-observed timing includes network round-trips, TLS, and driver deserialization — so a client far from the Snowflake region will see slower *end-to-end* times even though server execution is identical. The console prints a client-side QPS as a live signal, but it under-reports for exactly this reason; always publish the server-side figures. Run the load generator in (or near) the same cloud region to keep client overhead from dominating.
 - **Tune `--procs` to your core count.** One process cannot generate 1,000 truly-concurrent queries because of Python's GIL. A good starting point is `--procs = physical_core_count`. At c≥500 use 8+; the blog's c=1000 runs used `--procs 32`.
 - **Closed-loop, not open-loop.** Workers fire the next query immediately — this measures *maximum sustainable throughput*, not latency under a fixed arrival rate. If you need "latency at exactly 500 req/s," this is the wrong tool (use JMeter/k6 with a fixed rate).
 - **Cost is not measured here.** The benchmark reports throughput and latency, not credits consumed. Compute cost per query is left as a separate analysis — factor it in before drawing price/performance conclusions.

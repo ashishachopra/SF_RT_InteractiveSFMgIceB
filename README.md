@@ -1,6 +1,6 @@
 # Interactive Warehouse Concurrency Benchmark
 
-A lightweight, portable benchmark for measuring **high-throughput query concurrency** on Snowflake Interactive Warehouses. It drives 10 to 1,000+ simultaneous queries against a 1-billion-row table and reports both client- and server-side throughput and latency.
+A lightweight, portable benchmark for measuring **high-throughput query concurrency** on Snowflake Interactive Warehouses. It drives 10 to 1,000+ simultaneous queries against a 1-billion-row table and reports throughput and latency.
 
 ## Why not just use JMeter?
 

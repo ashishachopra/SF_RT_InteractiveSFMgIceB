@@ -33,44 +33,6 @@ The **masking-policy test** (optional) measures column-level governance overhead
 ## Results
 In short: on an XSMALL Interactive Warehouse, both query patterns held **sub-30ms p50 latency at 250 concurrent queries**, where an equivalently-sized regular warehouse degraded past 600ms under queuing. With a second cluster enabled, throughput scaled past **2,000 QPS at 1,000 concurrent queries**. Run it yourself — the numbers below are reproducible with the steps in this repo.
 
-## Prerequisites
-
-- Snowflake account with SYSADMIN role
-- Python 3.9+
-- `snowflake-connector-python >= 3.0`
-
-```bash
-pip install 'snowflake-connector-python>=3.0'
-```
-
-A named connection in `~/.snowflake/connections.toml`:
-
-```toml
-[my_connection]
-account = "your-account"
-user = "your_user"
-authenticator = "externalbrowser"    # or use password
-warehouse = "COMPUTE_XS_WH"
-database = "SNOW_DB"
-schema = "SNOW_SCHEMA"
-role = "SYSADMIN"
-```
-
-## Setup
-
-Run `sf_setup.sql` in Snowsight or SnowSQL. This creates:
-The 1B-row load is fast on an XL warehouse — typically a minute or two — and runs twice (standard table, then interactive table). Smaller or larger warehouses scale accordingly.
-
-## Quick Start
-
-```bash
-# Smoke test (c=1,10,50 for 30s each)
-python benchmark.py --connection my_connection
-
-# Full benchmark (c=10-1000 for 60s each)
-python benchmark.py --connection my_connection --full --procs 8
-```
-
 **Phases:**
 
 - **A — Single cluster** (MIN=MAX=1, XSMALL): all tables, measured at c=10, 50, 100, 250

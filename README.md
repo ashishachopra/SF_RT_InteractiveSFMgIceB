@@ -131,29 +131,50 @@ python benchmark.py --connection my_conn --full \
 | `--warehouses` | `IWH` (interactive) and/or `STD` (regular) |
 | `--queries` | `point_lookup`, `customer360`, and/or `point_lookup_email` |
 | `--duration` | Override seconds per level |
+| `--tag-extra` | Extra `KEY=VALUE` pairs merged into the `QUERY_TAG` JSON (e.g. `started_clusters=1`); integer-looking values are stored as integers |
 
 ### run_suite.py — Full Suite Orchestrator
 
-Runs the complete benchmark matrix with proper warming protocol:
+Runs the complete benchmark matrix across all three tables with the proper warming protocol. By default it runs phases **A** and **B**; the regular-WH baseline (phase C) is off by default.
 
 ```bash
-# Run all 3 phases
+# Run the default suite (phases A + B, all tables)
 python run_suite.py --connection my_conn
 
-# Run only Phase 3 (regular WH baseline)
-python run_suite.py --connection my_conn --phase 3
+# Run only the single-cluster phase
+python run_suite.py --connection my_conn --phase A
 
-# Shorter proactive cache wait (default: 15 min)
+# Also refresh the regular-WH baseline (phase C, off by default)
+python run_suite.py --connection my_conn --include-baseline
+
+# Run the multi-cluster phase at SMALL instead of XSMALL
+python run_suite.py --connection my_conn --phase B --mcw-size SMALL
+
+# Shorter proactive cache wait (default: 15 min per table)
 python run_suite.py --connection my_conn --warm-wait 10
 ```
 
 **Phases:**
 
-1. **Single cluster** — IT on IWH XS, c=10 through c=500
-2. **Multi-cluster** — MCW=2 at c=500 and c=1000 (procs=32)
-3. **Regular WH baseline** — FDN on COMPUTE_XS_WH, c=10 through c=250
+- **A — Single cluster** (MIN=MAX=1, XSMALL): all tables, measured at c=10, 50, 100, 250
+- **B — Multi-cluster** (MIN=MAX=2): all tables, measured at c=500, 1000
+- **C — Regular WH baseline** (FDN on `COMPUTE_XS_WH`, c=10–250): **off by default**, enable with `--include-baseline`
 
-Each phase includes: full-scan warming → benchmark warming → proactive cache wait → measured run.
+Each phase attaches the table, full-scan warms, benchmark warms, waits for the proactive cache, then **verifies the actual `started_clusters` count** (`SHOW WAREHOUSES`) before the measured run — aborting rather than risk a run contaminated by a leftover cluster. The verified count is stamped into each run's `QUERY_TAG`.
+
+**Key flags:**
+
+| Flag | Description |
+|---|---|
+| `--connection` | Named connection from `connections.toml` (required) |
+| `--phase` | Phases to run: `A` `B` (default: both) |
+| `--include-baseline` | Also run the regular-WH FDN baseline (phase C). Off by default |
+| `--warm-wait` | Proactive cache wait per table, in minutes (default: 15) |
+| `--mcw-size` | Warehouse size for phase B, e.g. `XSMALL` or `SMALL` (default: XSMALL); reverted to XSMALL on exit |
+| `--tables` | Subset of tables to run: `IT` `FDN` `IB` (default: all) |
+| `--mcw-levels` | Concurrency levels for phase B (default: `500 1000`). Prepend a warm-up level (e.g. `250 500 1000`) to self-warm each query |
+| `--queries` | Query subset (e.g. `point_lookup_email`). Default: `point_lookup` + `customer360` |
+| `--tag-extra` | Extra `KEY=VALUE` pairs merged into every measured run's `QUERY_TAG` (e.g. `masked=1`) |
 
 ## Customizing — Bring Your Own Queries
 
@@ -275,7 +296,7 @@ GROUP BY 1, 2 ORDER BY 1, 2;
 
 ### A note on fair comparison
 
-The suite deliberately warms the Interactive Warehouse (full-scan + benchmark warm + a proactive-cache wait) before measuring, because proactive caching is part of how it's meant to run. The regular-warehouse baseline (Phase 3) is **not** given the same warm-up. This is intentional — a regular warehouse has no proactive cache to prime — but it means the first queries in the baseline pay compilation and cold-scan costs. If you want a strictly warm-vs-warm comparison, add a warm-up pass before Phase 3 and note it in your results.
+The suite deliberately warms the Interactive Warehouse (full-scan + benchmark warm + a proactive-cache wait) before measuring, because proactive caching is part of how it's meant to run. The regular-warehouse baseline (phase C) is **not** given the same warm-up. This is intentional — a regular warehouse has no proactive cache to prime — but it means the first queries in the baseline pay compilation and cold-scan costs. If you want a strictly warm-vs-warm comparison, add a warm-up pass before phase C and note it in your results.
 
 ## Notes & Best Practices
 

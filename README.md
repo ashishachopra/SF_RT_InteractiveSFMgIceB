@@ -2,10 +2,6 @@
 
 A lightweight, portable benchmark for measuring **high-throughput query concurrency** on Snowflake Interactive Warehouses. It drives 10 to 1,000+ simultaneous queries against a 1-billion-row table and reports both client- and server-side throughput and latency.
 
-**Blog**: [Real-Time Analytics on Snowflake: A Repeatable Benchmark for Sub-Second Latency at Scale](https://medium.com/@paul.needleman/real-time-analytics-on-snowflake-a-repeatable-benchmark-for-sub-second-latency-at-scale-49b666f2deb2)
-
-> **Disclaimer.** This is an informal, self-run benchmark shared to be reproduced, not an official or audited Snowflake result and not a TPC-style certified benchmark. The views here are my own. All numbers were measured on a specific account, region, warehouse size, and client machine, and **your results will vary** with any of those. The value of this repo is the method and the fact that you can run it yourself — treat the figures as illustrative, and reproduce them in your own environment before drawing conclusions. Snowflake and Interactive Warehouse are trademarks of Snowflake Inc.
-
 ## Why not just use JMeter?
 
 Tools like JMeter, Gatling, or k6 are excellent general-purpose load generators, but for this specific job — pushing a database to its concurrency ceiling and reading the results back from the database's own telemetry — they add friction:
@@ -335,8 +331,6 @@ This tool is Snowflake-coupled by design, but the reusable core is engine-agnost
   - `make_connection()` — replace `snowflake.connector` with the target driver. Most (`databricks-sql-connector`, `clickhouse-connect`, `psycopg2`) follow the DBAPI 2.0 `connect/cursor/execute/fetch` shape, so the worker loop needs little change.
   - **Server-side metrics** — `QUERY_TAG` + `ACCOUNT_USAGE.QUERY_HISTORY` has no direct equivalent elsewhere. You would fall back to **client-side latency** (wrap each `execute()` in `time.perf_counter()`), which every engine supports but which underreports as noted above.
   - **Session/DDL specifics** — `USE_CACHED_RESULT`, interactive-table/warehouse DDL, and the setup script are Snowflake-only.
-
-A cross-engine comparison is only fair if each engine is configured and warmed correctly by someone who knows it well — otherwise you are benchmarking your own misconfiguration. Keep that caveat front-and-center if you publish comparative results.
 
 ## Files
 

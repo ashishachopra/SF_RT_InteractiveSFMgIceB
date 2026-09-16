@@ -188,13 +188,20 @@ def worker_loop(conn, query_sql, gen, stop_event, stats):
     """
     Closed-loop worker: fire a query, fetch one row, fire next.
     gen() returns (extra_clause, params) each call.
+
+    Tracks per-query client-side (wall-clock) latency in a thread-local
+    list -- no lock is taken during the loop, only once at the end when
+    merging into the shared stats dict. Two perf_counter() calls plus a
+    list append per query are negligible next to a network round trip.
     """
     local_count = 0
     local_errors = 0
     last_error = None
+    local_latencies = []
 
     while not stop_event.is_set():
         cur = conn.cursor()
+        t0 = time.perf_counter()
         try:
             extra, params = gen()
             sql = query_sql.replace("{extra}", extra)
@@ -203,6 +210,7 @@ def worker_loop(conn, query_sql, gen, stop_event, stats):
             else:
                 cur.execute(sql)
             cur.fetchone()
+            local_latencies.append((time.perf_counter() - t0) * 1000.0)
             local_count += 1
         except Exception as e:
             local_errors += 1
@@ -213,8 +221,24 @@ def worker_loop(conn, query_sql, gen, stop_event, stats):
     with stats["lock"]:
         stats["completed"] += local_count
         stats["errors"] += local_errors
+        stats["latencies"].extend(local_latencies)
         if last_error:
             stats["last_error"] = last_error
+
+
+# ---------------------------------------------------------------------------
+# Small helper: linear-interpolation percentile over a pre-sorted list.
+# ---------------------------------------------------------------------------
+
+def _percentile(sorted_list, pct):
+    if not sorted_list:
+        return None
+    k = (len(sorted_list) - 1) * pct
+    f = int(k)
+    c = min(f + 1, len(sorted_list) - 1)
+    if f == c:
+        return sorted_list[f]
+    return sorted_list[f] + (sorted_list[c] - sorted_list[f]) * (k - f)
 
 
 # ---------------------------------------------------------------------------
@@ -231,7 +255,7 @@ def _run_workers(connection_name, warehouse, query_sql, gen, concurrency,
     pool = create_pool(connection_name, warehouse, pool_size, tag_json)
 
     stats = {"completed": 0, "errors": 0, "last_error": None,
-             "lock": threading.Lock()}
+             "latencies": [], "lock": threading.Lock()}
     stop_event = threading.Event()
 
     wall_start = time.perf_counter()
@@ -251,7 +275,7 @@ def _run_workers(connection_name, warehouse, query_sql, gen, concurrency,
     close_pool(pool)
 
     return (stats["completed"], wall_elapsed,
-            stats["errors"], stats["last_error"])
+            stats["errors"], stats["last_error"], stats["latencies"])
 
 
 def _proc_entry(connection_name, warehouse, query_sql, qry_name, concurrency,
@@ -263,10 +287,10 @@ def _proc_entry(connection_name, warehouse, query_sql, qry_name, concurrency,
     children do not inherit the parent's runtime globals.
     """
     gen = QUERY_TEMPLATES[qry_name]["gen"]
-    completed, elapsed, errors, last_error = _run_workers(
+    completed, elapsed, errors, last_error, latencies = _run_workers(
         connection_name, warehouse, query_sql, gen,
         concurrency, duration_sec, tag_json)
-    result_q.put((completed, elapsed, errors, last_error))
+    result_q.put((completed, elapsed, errors, last_error, latencies))
 
 
 def run_benchmark(run_id, connection_name, warehouse, tbl_label, test_name,
@@ -299,7 +323,7 @@ def run_benchmark(run_id, connection_name, warehouse, tbl_label, test_name,
           f"procs={procs_to_use} (threads/proc={slices})")
 
     if procs_to_use == 1:
-        completed, wall_elapsed, errors, last_error = _run_workers(
+        completed, wall_elapsed, errors, last_error, latencies = _run_workers(
             connection_name, warehouse, query_sql, gen,
             concurrency, duration_sec, tag_json)
     else:
@@ -315,17 +339,29 @@ def run_benchmark(run_id, connection_name, warehouse, tbl_label, test_name,
             processes.append(p)
 
         completed, errors, elapseds, last_error = 0, 0, [], None
+        latencies = []
+        proc_counts = []
         for _ in processes:
-            c, el, er, lerr = result_q.get()
+            c, el, er, lerr, lat = result_q.get()
             completed += c
             errors += er
             elapseds.append(el)
+            latencies.extend(lat)
+            proc_counts.append(c)
             if lerr:
                 last_error = lerr
         for p in processes:
             p.join()
         # Fall back to the intended run duration, not an absolute timestamp.
         wall_elapsed = max(elapseds) if elapseds else float(duration_sec)
+        # Surface per-process completion counts. A healthy run has roughly
+        # even counts; a big spread (or near-zero procs) means some workers
+        # stalled or dropped mid-run and the throughput number is suspect.
+        lo, hi = min(proc_counts), max(proc_counts)
+        skew = f"{lo}-{hi}"
+        if lo and hi / lo > 2:
+            skew += "  WARNING: uneven per-proc load (possible worker stall)"
+        print(f"    per-proc completed: {skew}", flush=True)
 
     qps = completed / wall_elapsed if wall_elapsed else 0
     msg = f"    done. {completed} queries, {qps:.1f} QPS, {errors} errors"
@@ -333,7 +369,18 @@ def run_benchmark(run_id, connection_name, warehouse, tbl_label, test_name,
         msg += f" (last: {last_error[:80]})"
     print(msg, flush=True)
 
-    return completed, wall_elapsed, errors
+    client_stats = (None, None, None, 0)
+    if latencies:
+        latencies.sort()
+        client_stats = (_percentile(latencies, 0.50),
+                        _percentile(latencies, 0.90),
+                        _percentile(latencies, 0.99),
+                        len(latencies))
+        print(f"    client-side (wall-clock): p50={client_stats[0]:.1f}ms "
+              f"p90={client_stats[1]:.1f}ms p99={client_stats[2]:.1f}ms "
+              f"(n={client_stats[3]})", flush=True)
+
+    return completed, wall_elapsed, errors, client_stats
 
 
 # ---------------------------------------------------------------------------
@@ -498,16 +545,17 @@ def main():
     print(f"Procs:        {args.procs}")
     print("=" * 80)
 
+    client_latency_rows = []
+
     for wh_label, wh_name in warehouses.items():
         for tbl_label, tbl_name in tables.items():
             for qry_name, qry_config in queries.items():
                 test_name = f"{qry_config['label']} [{tbl_label}]"
                 query_sql = qry_config["sql"].replace("{table}", tbl_name)
-
                 print(f"\n--- {test_name} on {wh_label} ({wh_name}) ---")
 
                 for concurrency in concurrency_levels:
-                    run_benchmark(
+                    completed, wall_elapsed, errors, client_stats = run_benchmark(
                         run_id=run_id,
                         connection_name=args.connection,
                         warehouse=wh_name,
@@ -521,9 +569,22 @@ def main():
                         procs=args.procs,
                         tag_extra=tag_extra,
                     )
+                    client_latency_rows.append(
+                        (test_name, tbl_label, wh_label, concurrency,
+                         *client_stats))
 
     # Collect server-side metrics
     columns, rows = collect_results(args.connection, run_id)
+
+    if client_latency_rows:
+        client_csv = f"client_latency_{run_id}.csv"
+        with open(client_csv, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["test", "table", "warehouse", "concurrency",
+                              "client_p50_ms", "client_p90_ms",
+                              "client_p99_ms", "n"])
+            writer.writerows(client_latency_rows)
+        print(f"\nClient-side (wall-clock) CSV saved: {client_csv}")
 
     if not rows:
         print("\nWARNING: No results in QUERY_HISTORY yet.")

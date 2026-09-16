@@ -31,9 +31,6 @@ Across three table types:
 The **masking-policy test** (optional) measures column-level governance overhead: run `point_lookup_email` with the `EMAIL_MASK` policy attached to `CUSTOMER_EMAIL`, then detach it and re-run, and compare throughput/latency. Setup for both IB and the masking policy is in `sf_setup.sql` (both optional).
 
 ## Results
-
-Full results, charts, and analysis are in the [companion blog post](https://medium.com/@paul.needleman/real-time-analytics-on-snowflake-a-repeatable-benchmark-for-sub-second-latency-at-scale-49b666f2deb2).
-
 In short: on an XSMALL Interactive Warehouse, both query patterns held **sub-30ms p50 latency at 250 concurrent queries**, where an equivalently-sized regular warehouse degraded past 600ms under queuing. With a second cluster enabled, throughput scaled past **2,000 QPS at 1,000 concurrent queries**. Run it yourself — the numbers below are reproducible with the steps in this repo.
 
 ## Prerequisites
@@ -62,19 +59,6 @@ role = "SYSADMIN"
 ## Setup
 
 Run `sf_setup.sql` in Snowsight or SnowSQL. This creates:
-
-1. Database `SNOW_DB` and schema `SNOW_SCHEMA`
-2. `TXN_HISTORY` — standard table (FDN), 1B rows, clustered by `CUSTOMER_ID`
-3. `TXN_HISTORY_IT` — interactive table (IT), same data
-4. `COMPUTE_XS_WH` — regular XSMALL warehouse (baseline)
-5. `TXN_INTERACTIVE_WH` — interactive XSMALL warehouse
-
-It also contains **optional** sections — commented out with their prerequisites — for an external Iceberg table (IB) and the `EMAIL_MASK` masking policy (governance-overhead test). Neither is required for the core FDN/IT benchmarks; uncomment them only if you want those scenarios.
-
-```bash
-snowsql -c my_connection -f sf_setup.sql
-```
-
 The 1B-row load is fast on an XL warehouse — typically a minute or two — and runs twice (standard table, then interactive table). Smaller or larger warehouses scale accordingly.
 
 ## Quick Start
@@ -87,136 +71,11 @@ python benchmark.py --connection my_connection
 python benchmark.py --connection my_connection --full --procs 8
 ```
 
-## Usage
-
-### benchmark.py — Core Engine
-
-The benchmark engine. Runs N concurrent closed-loop queries for a fixed duration, then collects server-side metrics from `QUERY_HISTORY`.
-
-```bash
-# Test IT on IWH, all queries, c=10-1000
-python benchmark.py --connection my_conn --full \
-    --tables IT --warehouses IWH --procs 8
-
-# Test FDN on regular warehouse, c=10-250
-python benchmark.py --connection my_conn --full \
-    --tables FDN --warehouses STD \
-    --levels 10 50 100 250
-
-# Single query type
-python benchmark.py --connection my_conn --full \
-    --tables IT --warehouses IWH \
-    --queries point_lookup --procs 8
-
-# Masking-policy overhead: run the email query with EMAIL_MASK attached to
-# CUSTOMER_EMAIL, then UNSET it (see sf_setup.sql) and re-run to compare.
-python benchmark.py --connection my_conn --full \
-    --tables IT --warehouses IWH \
-    --queries point_lookup_email --procs 8
-```
-
-**Key flags:**
-
-| Flag | Description |
-|---|---|
-| `--connection` | Named connection from `connections.toml` (required) |
-| `--full` | Full concurrency levels (10-1000, 60s each) |
-| `--procs N` | Parallel Python processes. **Use 8+ at c>=500** to avoid GIL bottleneck |
-| `--levels` | Override concurrency levels |
-| `--tables` | `IT` (interactive), `FDN` (standard), and/or `IB` (Iceberg) |
-| `--warehouses` | `IWH` (interactive) and/or `STD` (regular) |
-| `--queries` | `point_lookup`, `customer360`, and/or `point_lookup_email` |
-| `--duration` | Override seconds per level |
-| `--tag-extra` | Extra `KEY=VALUE` pairs merged into the `QUERY_TAG` JSON (e.g. `started_clusters=1`); integer-looking values are stored as integers |
-
-### run_suite.py — Full Suite Orchestrator
-
-Runs the complete benchmark matrix across all three tables with the proper warming protocol. By default it runs phases **A** and **B**; the regular-WH baseline (phase C) is off by default.
-
-```bash
-# Run the default suite (phases A + B, all tables)
-python run_suite.py --connection my_conn
-
-# Run only the single-cluster phase
-python run_suite.py --connection my_conn --phase A
-
-# Also refresh the regular-WH baseline (phase C, off by default)
-python run_suite.py --connection my_conn --include-baseline
-
-# Run the multi-cluster phase at SMALL instead of XSMALL
-python run_suite.py --connection my_conn --phase B --mcw-size SMALL
-
-# Shorter proactive cache wait (default: 15 min per table)
-python run_suite.py --connection my_conn --warm-wait 10
-```
-
 **Phases:**
 
 - **A — Single cluster** (MIN=MAX=1, XSMALL): all tables, measured at c=10, 50, 100, 250
 - **B — Multi-cluster** (MIN=MAX=2): all tables, measured at c=500, 1000
 - **C — Regular WH baseline** (FDN on `COMPUTE_XS_WH`, c=10–250): **off by default**, enable with `--include-baseline`
-
-Each phase attaches the table, full-scan warms, benchmark warms, waits for the proactive cache, then **verifies the actual `started_clusters` count** (`SHOW WAREHOUSES`) before the measured run — aborting rather than risk a run contaminated by a leftover cluster. The verified count is stamped into each run's `QUERY_TAG`.
-
-**Key flags:**
-
-| Flag | Description |
-|---|---|
-| `--connection` | Named connection from `connections.toml` (required) |
-| `--phase` | Phases to run: `A` `B` (default: both) |
-| `--include-baseline` | Also run the regular-WH FDN baseline (phase C). Off by default |
-| `--warm-wait` | Proactive cache wait per table, in minutes (default: 15) |
-| `--mcw-size` | Warehouse size for phase B, e.g. `XSMALL` or `SMALL` (default: XSMALL); reverted to XSMALL on exit |
-| `--tables` | Subset of tables to run: `IT` `FDN` `IB` (default: all) |
-| `--mcw-levels` | Concurrency levels for phase B (default: `500 1000`). Prepend a warm-up level (e.g. `250 500 1000`) to self-warm each query |
-| `--queries` | Query subset (e.g. `point_lookup_email`). Default: `point_lookup` + `customer360` |
-| `--tag-extra` | Extra `KEY=VALUE` pairs merged into every measured run's `QUERY_TAG` (e.g. `masked=1`) |
-
-## Customizing — Bring Your Own Queries
-
-This is meant to be a **flexible harness, not a fixed test**. The two shipped queries are just examples of a selective-lookup pattern — swap in your own workload and the whole concurrency/latency/QPS machinery works unchanged.
-
-Queries live in the `QUERY_TEMPLATES` dict in `benchmark.py`. Each entry has three parts:
-
-```python
-QUERY_TEMPLATES = {
-    "my_query": {                          # <- the name you pass to --queries
-        "label": "My Query",               # <- shows up in output + QUERY_TAG
-        "sql": "SELECT ... FROM {table} WHERE some_col = %s {extra}",
-        "gen": _my_gen,                    # <- returns (extra_clause, params) per call
-    },
-}
-```
-
-- **`{table}`** is substituted with the fully-qualified table name at runtime, so one template runs against FDN, IT, or IB without edits.
-- **`%s`** placeholders are bound safely from the `params` tuple your `gen()` returns (never string-formatted — avoids SQL injection and lets Snowflake cache the plan).
-- **`gen()`** is called once per query execution and returns `(extra_clause, params)`:
-  - `params` — the bind values (e.g. a random id) so every execution hits different data and you're not just re-serving one cached row.
-  - `extra_clause` — optional text spliced in at `{extra}` for cases where you need to vary structure, not just values (e.g. a random `LIMIT` or an added predicate). Return `""` if unused.
-
-Example — a random date-range scan:
-
-```python
-def _date_range_gen():
-    start = random.randint(1, 2000)                 # days ago
-    span  = random.choice([7, 30, 90])
-    return "", (start, start - span)                # two bind params
-
-QUERY_TEMPLATES["recent_window"] = {
-    "label": "Recent Window",
-    "sql": ("SELECT STORE_STATE_CD, SUM(UNIT_PRICE*QUANTITY) FROM {table} "
-            "WHERE TXN_DATE BETWEEN DATEADD('day', -%s, CURRENT_DATE) "
-            "AND DATEADD('day', -%s, CURRENT_DATE) GROUP BY 1"),
-    "gen": _date_range_gen,
-}
-```
-
-Then run just your query:
-
-```bash
-python benchmark.py --connection my_conn --full \
-    --tables IT --warehouses IWH --queries recent_window --procs 8
-```
 
 Two things to keep in mind when you bring your own queries:
 - **Cluster the table on whatever column your query filters on** (see best practices) so pruning reflects a real production design.
@@ -250,36 +109,6 @@ Two things to keep in mind when you bring your own queries:
 3. Waits 15 minutes for the proactive caching system to optimize data placement
 4. Then runs the measured test
 
-## Server-Side Metrics
-
-Client-side QPS underreports at high concurrency due to connection setup time and Python overhead. The benchmark tags every query with a JSON `QUERY_TAG`:
-
-```json
-{
-    "run_id": "20260914_130140_d56e38",
-    "test": "Point Lookup [IT]",
-    "warehouse": "IT/IWH",
-    "concurrency": 1000
-}
-```
-
-Query server-side metrics via `ACCOUNT_USAGE` (available ~45 min after the run):
-
-```sql
-SELECT PARSE_JSON(query_tag):test::STRING   AS test,
-       PARSE_JSON(query_tag):concurrency::INT AS conc,
-       COUNT(*)                               AS n,
-       ROUND(COUNT(*) / 60.0)               AS qps,
-       APPROX_PERCENTILE(total_elapsed_time, 0.50) AS p50,
-       APPROX_PERCENTILE(total_elapsed_time, 0.90) AS p90,
-       APPROX_PERCENTILE(total_elapsed_time, 0.99) AS p99
-FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
-WHERE query_tag LIKE '%YOUR_RUN_ID%'
-  AND query_type = 'SELECT' AND execution_status = 'SUCCESS'
-  AND start_time >= CURRENT_DATE
-GROUP BY 1, 2 ORDER BY 1, 2;
-```
-
 > **Important — the in-script summary is only a sample at high concurrency.**
 > After each run the script prints a server-side table pulled from
 > `INFORMATION_SCHEMA.QUERY_HISTORY`, which is capped at 10,000 rows per call.
@@ -302,25 +131,6 @@ Each `benchmark.py` run writes up to two CSVs, named by `run_id`:
 The **client-side wall-clock** capture times each query end-to-end on the client — from just before `execute()` to just after the fetch — in a thread-local list per worker, merged after each level. The console prints a `client-side (wall-clock): p50/p90/p99` line per level, and the full breakdown lands in `client_latency_<run_id>.csv`.
 
 This is the one place the tool reports **end-to-end** latency (network round-trip + TLS + driver deserialization + server execution), so it's the number to use when you care about *what the application actually experiences* — e.g. quantifying the network tax between your client region and the Snowflake region. It is **not** a substitute for the server-side figures: at high concurrency the client is a variable (GIL, cores, network), so wall-clock over-reports latency and under-reports QPS. Use `benchmark_<run_id>.csv` / `ACCOUNT_USAGE` for headline numbers and `client_latency_<run_id>.csv` to characterize the client/network overhead on top.
-
-### A note on fair comparison
-
-The suite deliberately warms the Interactive Warehouse (full-scan + benchmark warm + a proactive-cache wait) before measuring, because proactive caching is part of how it's meant to run. The regular-warehouse baseline (phase C) is **not** given the same warm-up. This is intentional — a regular warehouse has no proactive cache to prime — but it means the first queries in the baseline pay compilation and cold-scan costs. If you want a strictly warm-vs-warm comparison, add a warm-up pass before phase C and note it in your results.
-
-## Notes & Best Practices
-
-Read this before trusting any number the tool prints.
-
-- **Warm vs. cold cache.** All headline results are for a *warmed* warehouse. Interactive Warehouses use proactive caching; a cold warehouse will show much higher latency for the first queries. The suite's warming protocol exists precisely to remove this variable — don't compare a cold run to a warm one.
-- **Clustering follows Snowflake best practice.** The tables are `CLUSTER BY (CUSTOMER_ID)` and loaded `ORDER BY CUSTOMER_ID` because the workload is selective lookups on `CUSTOMER_ID` — and aligning the clustering key with the filter column is the standard way to design any high-selectivity table on Snowflake, interactive or not. It lets the engine prune to the handful of micro-partitions that hold a customer's rows instead of scanning the whole table. This isn't specific to the benchmark; it's how you'd model this table in production. If you adapt the queries to filter on a different column, cluster on that column so the same pruning applies. (Skip clustering entirely and you'd be measuring a full-table scan, which is a different workload than the low-latency lookups this benchmark targets.)
-- **The client machine is a variable.** At high concurrency the *load generator* can become the bottleneck before the warehouse does. Results in the blog were generated from a 12-core laptop. Fewer cores, a busy machine, or high network latency to the Snowflake region will cap the concurrency you can actually generate. Run from a machine in (or near) the same cloud region for cleanest numbers, and watch client CPU during the run.
-- **Reported numbers are server-side execution time, not client wall-clock.** The authoritative latency/QPS come from `QUERY_HISTORY` (`total_elapsed_time`), i.e. time measured inside Snowflake. Client-observed timing includes network round-trips, TLS, and driver deserialization — so a client far from the Snowflake region will see slower *end-to-end* times even though server execution is identical. The tool also captures client-side wall-clock latency (printed per level and saved to `client_latency_<run_id>.csv`) so you can quantify that end-to-end tax, but it under-reports throughput at high concurrency for exactly this reason; always publish the server-side figures. Run the load generator in (or near) the same cloud region to keep client overhead from dominating.
-- **Tune `--procs` to your core count.** One process cannot generate 1,000 truly-concurrent queries because of Python's GIL. A good starting point is `--procs = physical_core_count`. At c≥500 use 8+; the blog's c=1000 runs used `--procs 32`.
-- **Closed-loop, not open-loop.** Workers fire the next query immediately — this measures *maximum sustainable throughput*, not latency under a fixed arrival rate. If you need "latency at exactly 500 req/s," this is the wrong tool (use JMeter/k6 with a fixed rate).
-- **Cost is not measured here.** The benchmark reports throughput and latency, not credits consumed. Compute cost per query is left as a separate analysis — factor it in before drawing price/performance conclusions.
-- **Run more than once.** Cloud performance varies run-to-run. Take the median of 3+ runs before quoting a number, and keep the `run_id`s so you can audit them later in `ACCOUNT_USAGE`.
-- **`sf_setup.sql` uses an XLARGE warehouse to generate 1B rows.** That is not free and the INSERT runs twice (standard + interactive table). It auto-suspends after 60s, but be aware of the credits before running it.
-- **Full suite takes ~2+ hours.** Each phase includes two 15-minute cache-priming waits. Use `--warm-wait` to shorten for smoke tests, but shortening the wait changes the results.
 
 ## Porting to Another Engine (Databricks, ClickHouse, Postgres, …)
 

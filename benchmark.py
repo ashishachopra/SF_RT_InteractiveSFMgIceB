@@ -34,6 +34,7 @@ Prerequisites:
 """
 
 import argparse
+import os
 import time
 import random
 import json
@@ -136,10 +137,22 @@ MODES = {
 # ---------------------------------------------------------------------------
 
 def make_connection(connection_name, warehouse_override=None):
-    """Create a connection using a named entry from connections.toml."""
+    """Create a connection using a named entry from connections.toml.
+
+    If SNOWFLAKE_PAT_FILE is set, its contents (a programmatic access token)
+    are used for password auth, overriding the profile's authenticator. This
+    is a portability escape hatch for environments where the connector's PAT
+    authenticator path is unavailable; the toml still supplies account/user/
+    host/role/warehouse/etc.
+    """
     kwargs = {"connection_name": connection_name}
     if warehouse_override:
         kwargs["warehouse"] = warehouse_override
+    pat_file = os.environ.get("SNOWFLAKE_PAT_FILE")
+    if pat_file:
+        with open(pat_file) as f:
+            kwargs["password"] = f.read().strip()
+        kwargs["authenticator"] = "snowflake"
     return snowflake.connector.connect(**kwargs)
 
 
@@ -257,12 +270,17 @@ def _proc_entry(connection_name, warehouse, query_sql, qry_name, concurrency,
 
 
 def run_benchmark(run_id, connection_name, warehouse, tbl_label, test_name,
-                  query_sql, qry_name, gen, concurrency, duration_sec, procs):
+                  query_sql, qry_name, gen, concurrency, duration_sec, procs,
+                  tag_extra=None):
     """
     Sustained throughput test.
 
     When procs > 1, concurrency is divided across processes so each process
     runs concurrency // procs threads on its own GIL.
+
+    tag_extra: optional dict of extra key/value pairs merged into the
+    QUERY_TAG JSON (e.g. {"started_clusters": 1, "warehouse_size": "XSMALL"}),
+    so runtime warehouse state is recorded server-side for later recall.
     """
     tag_json = {
         "run_id": run_id,
@@ -270,6 +288,8 @@ def run_benchmark(run_id, connection_name, warehouse, tbl_label, test_name,
         "warehouse": tbl_label,
         "concurrency": concurrency,
     }
+    if tag_extra:
+        tag_json.update(tag_extra)
 
     procs_to_use = min(procs, concurrency)
     base, rem = divmod(concurrency, procs_to_use)
@@ -418,7 +438,23 @@ def main():
                              "point_lookup_email). Default: all")
     parser.add_argument("--duration", type=int, default=None,
                         help="Override run duration in seconds")
+    parser.add_argument("--tag-extra", nargs="*", default=None,
+                        metavar="KEY=VALUE",
+                        help="Extra key=value pairs merged into the QUERY_TAG "
+                             "JSON (e.g. --tag-extra started_clusters=1 "
+                             "warehouse_size=XSMALL). Values that look like "
+                             "integers are stored as integers.")
     args = parser.parse_args()
+
+    # Parse --tag-extra KEY=VALUE pairs into a dict (ints coerced).
+    tag_extra = {}
+    if args.tag_extra:
+        for pair in args.tag_extra:
+            if "=" not in pair:
+                print(f"ERROR: --tag-extra entry '{pair}' is not KEY=VALUE.")
+                raise SystemExit(1)
+            k, v = pair.split("=", 1)
+            tag_extra[k] = int(v) if v.lstrip("-").isdigit() else v
 
     # Preflight: verify the named connection resolves and works before we
     # spin up hundreds of workers. Fails fast with a readable message.
@@ -483,6 +519,7 @@ def main():
                         concurrency=concurrency,
                         duration_sec=duration_sec,
                         procs=args.procs,
+                        tag_extra=tag_extra,
                     )
 
     # Collect server-side metrics
